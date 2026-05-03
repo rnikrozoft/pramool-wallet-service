@@ -20,18 +20,18 @@ import (
 )
 
 type WalletService struct {
-	repository     *repository.WalletRepository
-	omiseSecretKey string
+	repository        *repository.WalletRepository
+	omiseSecretKey    string
+	systemRecipientID string
 }
 
-func NewWalletService(omiseSecretKey string, repository *repository.WalletRepository) *WalletService {
+func NewWalletService(omiseSecretKey, systemRecipientID string, repository *repository.WalletRepository) *WalletService {
 	return &WalletService{
-		repository:     repository,
-		omiseSecretKey: strings.TrimSpace(omiseSecretKey),
+		repository:        repository,
+		omiseSecretKey:    strings.TrimSpace(omiseSecretKey),
+		systemRecipientID: strings.TrimSpace(systemRecipientID),
 	}
 }
-
-const transactionListLimit = 100
 
 func (s *WalletService) NewChargeID() string {
 	return "chrg_local_" + strconv.FormatInt(time.Now().UnixNano(), 10)
@@ -191,8 +191,16 @@ func (s *WalletService) ProcessWebhookCharge(chargeID, status string, paid bool)
 	return s.repository.AddUserCredit(topup.UserID, topup.Amount)
 }
 
-func (s *WalletService) ListTransactions(userID string) ([]entity.Transaction, error) {
-	return s.repository.ListTransactionsByUser(userID, transactionListLimit)
+func (s *WalletService) ListCreditActivity(userID string, limit, offset int, filter string) ([]entity.CreditActivityRow, int, error) {
+	total, err := s.repository.CountCreditActivity(userID, filter)
+	if err != nil {
+		return nil, 0, err
+	}
+	rows, err := s.repository.ListCreditActivity(userID, limit, offset, filter)
+	if err != nil {
+		return nil, 0, err
+	}
+	return rows, total, nil
 }
 
 func (s *WalletService) VerifyOmiseSignature(secretBase64, signatureHeader, timestamp string, body []byte) bool {
@@ -218,4 +226,54 @@ func (s *WalletService) VerifyOmiseSignature(secretBase64, signatureHeader, time
 		}
 	}
 	return false
+}
+
+func (s *WalletService) createTransfer(recipientID string, amount int64) error {
+	values := url.Values{}
+	values.Set("amount", fmt.Sprintf("%d", amount*100))
+	values.Set("currency", "thb")
+	values.Set("recipient", recipientID)
+
+	req, err := http.NewRequest(http.MethodPost, "https://api.omise.co/transfers", strings.NewReader(values.Encode()))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	_, err = omisehttp.Do(http.DefaultClient, s.omiseSecretKey, req, "omise transfer failed")
+	return err
+}
+
+func (s *WalletService) ChargeAuctionCloseFee(sellerID, auctionID string, transferAmount, creditDeduct int64) error {
+	sellerID = strings.TrimSpace(sellerID)
+	auctionID = strings.TrimSpace(auctionID)
+	if sellerID == "" || auctionID == "" || transferAmount <= 0 {
+		return errors.New("invalid auction close fee payload")
+	}
+	if creditDeduct < 0 {
+		creditDeduct = 0
+	}
+	var affected int64
+	var err error
+	if creditDeduct > 0 {
+		affected, err = s.repository.DeductUserCreditIfEnough(sellerID, creditDeduct)
+		if err != nil {
+			return err
+		}
+		if affected == 0 {
+			return errors.New("insufficient credit for early-close fee")
+		}
+	}
+	if s.omiseSecretKey == "" || s.systemRecipientID == "" {
+		if creditDeduct > 0 {
+			_ = s.repository.AddUserCredit(sellerID, creditDeduct)
+		}
+		return errors.New("missing omise system recipient configuration")
+	}
+	if err := s.createTransfer(s.systemRecipientID, transferAmount); err != nil {
+		if creditDeduct > 0 {
+			_ = s.repository.AddUserCredit(sellerID, creditDeduct)
+		}
+		return err
+	}
+	return nil
 }

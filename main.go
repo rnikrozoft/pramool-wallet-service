@@ -45,12 +45,13 @@ func main() {
 	}))
 
 	walletRepository := repository.NewWalletRepository(conn)
-	walletService := service.NewWalletService(os.Getenv("OMISE_SECRET_KEY"), walletRepository)
-	walletHandler := handler.NewWalletHandler(walletService, webhookSecret)
+	walletService := service.NewWalletService(os.Getenv("OMISE_SECRET_KEY"), strings.TrimSpace(os.Getenv("OMISE_SYSTEM_RECIPIENT_ID")), walletRepository)
+	walletHandler := handler.NewWalletHandler(walletService, webhookSecret, os.Getenv("WALLET_INTERNAL_KEY"))
 	m := middleware.Middleware{JWTSecret: jwtSecret}
 
 	app.Post("/wallet/topup", m.JWTMiddleware, walletHandler.Topup)
 	app.Get("/wallet/transactions", m.JWTMiddleware, walletHandler.Transactions)
+	app.Post("/wallet/internal/auction-close-fee", walletHandler.ChargeAuctionCloseFee)
 	app.Post("/webhooks/omise", walletHandler.OmiseWebhook)
 
 	log.Fatal(app.Listen(":" + port))
