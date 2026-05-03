@@ -167,6 +167,34 @@ func (s *WalletService) getPromptPayQRFromSource(sourceID string) (string, error
 	return source.ScannableCode.Image.DownloadURI, nil
 }
 
+// FetchChargeStateFromAPI loads charge paid/status from Omise (GET /charges/:id).
+// Use when webhook requests have no Omise-Signature headers — Omise only sends signatures after you configure a webhook secret in the dashboard; otherwise use this event-verification path per https://docs.omise.co/api-webhooks#protecting-your-endpoints
+func (s *WalletService) FetchChargeStateFromAPI(chargeID string) (status string, paid bool, err error) {
+	chargeID = strings.TrimSpace(chargeID)
+	if chargeID == "" {
+		return "", false, errors.New("empty charge id")
+	}
+	if s.omiseSecretKey == "" {
+		return "", false, errors.New("missing omise secret key")
+	}
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("https://api.omise.co/charges/%s", url.PathEscape(chargeID)), nil)
+	if err != nil {
+		return "", false, err
+	}
+	body, err := omisehttp.Do(http.DefaultClient, s.omiseSecretKey, req, "omise charge fetch failed")
+	if err != nil {
+		return "", false, err
+	}
+	var ch struct {
+		Status string `json:"status"`
+		Paid   bool   `json:"paid"`
+	}
+	if err := json.Unmarshal(body, &ch); err != nil {
+		return "", false, err
+	}
+	return strings.TrimSpace(ch.Status), ch.Paid, nil
+}
+
 func (s *WalletService) ProcessWebhookCharge(chargeID, status string, paid bool) error {
 	if err := s.repository.UpdateTransactionStatus(chargeID, status, paid); err != nil {
 		return err
@@ -203,25 +231,67 @@ func (s *WalletService) ListCreditActivity(userID string, limit, offset int, fil
 	return rows, total, nil
 }
 
+// decodeOmiseWebhookSecret decodes the webhook signing key from the Omise Dashboard (base64).
+// Accepts standard / URL-safe / raw variants—mis-pasted secrets are a common cause of 401 on webhooks.
+func decodeOmiseWebhookSecret(secretBase64 string) ([]byte, error) {
+	s := strings.Trim(strings.TrimSpace(secretBase64), "\"'")
+	if s == "" {
+		return nil, fmt.Errorf("empty webhook secret")
+	}
+	decoders := []*base64.Encoding{
+		base64.StdEncoding,
+		base64.URLEncoding,
+		base64.RawStdEncoding,
+		base64.RawURLEncoding,
+	}
+	var lastErr error
+	for _, dec := range decoders {
+		b, err := dec.DecodeString(s)
+		if err == nil && len(b) > 0 {
+			return b, nil
+		}
+		lastErr = err
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, fmt.Errorf("invalid webhook secret encoding")
+}
+
+// VerifyOmiseSignature matches Omise docs: HMAC-SHA256 over "timestamp.rawBody" with base64-decoded secret;
+// Omise-Signature header is comma-separated hex digests (secret rotation). Timestamp is required when signing is used.
 func (s *WalletService) VerifyOmiseSignature(secretBase64, signatureHeader, timestamp string, body []byte) bool {
-	secret, err := base64.StdEncoding.DecodeString(strings.TrimSpace(secretBase64))
+	secret, err := decodeOmiseWebhookSecret(secretBase64)
 	if err != nil || signatureHeader == "" {
 		return false
 	}
-	signedPayload := body
-	if timestamp != "" {
-		signedPayload = []byte(timestamp + "." + string(body))
+	ts := strings.TrimSpace(timestamp)
+	if ts == "" {
+		return false
 	}
+	// Build timestamp + "." + body without string(body) allocation pitfalls on binary-safe payload.
+	signedLen := len(ts) + 1 + len(body)
+	signedPayload := make([]byte, 0, signedLen)
+	signedPayload = append(signedPayload, ts...)
+	signedPayload = append(signedPayload, '.')
+	signedPayload = append(signedPayload, body...)
+
 	mac := hmac.New(sha256.New, secret)
 	mac.Write(signedPayload)
 	expected := mac.Sum(nil)
+
 	for _, part := range strings.Split(signatureHeader, ",") {
-		sig := strings.Trim(strings.TrimSpace(strings.TrimPrefix(strings.ToLower(part), "sha256=")), "\"'")
-		if sig == "" {
+		part = strings.TrimSpace(part)
+		part = strings.TrimPrefix(strings.TrimPrefix(strings.ToLower(part), "sha256="), "v1=")
+		part = strings.Trim(part, "\"'")
+		if part == "" {
 			continue
 		}
-		got, err := hex.DecodeString(sig)
-		if err == nil && hmac.Equal(got, expected) {
+		got, err := hex.DecodeString(part)
+		if err != nil || len(got) != len(expected) {
+			continue
+		}
+		if hmac.Equal(got, expected) {
 			return true
 		}
 	}

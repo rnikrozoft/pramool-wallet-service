@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"encoding/json"
 	"strconv"
 	"strings"
 
@@ -59,29 +60,62 @@ func (h *WalletHandler) Transactions(c *fiber.Ctx) error {
 	return c.JSON(mapper.CreditActivityRowsToResponse(rows, total, limit, offset))
 }
 
-func (h *WalletHandler) OmiseWebhook(c *fiber.Ctx) error {
-	if h.webhookSecret == "" {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"message": "missing webhook secret"})
+func omiseWebhookHeaders(c *fiber.Ctx) (signature string, timestamp string) {
+	h := &c.Request().Header
+	if v := h.Peek("Omise-Signature"); len(v) > 0 {
+		signature = string(v)
+	} else if v := h.Peek("X-Omise-Signature"); len(v) > 0 {
+		signature = string(v)
 	}
+	if v := h.Peek("Omise-Signature-Timestamp"); len(v) > 0 {
+		timestamp = string(v)
+	}
+	return strings.TrimSpace(signature), strings.TrimSpace(timestamp)
+}
 
-	signature := strings.TrimSpace(c.Get("omise-signature"))
-	if signature == "" {
-		signature = strings.TrimSpace(c.Get("x-omise-signature"))
-	}
-	timestamp := c.Get("omise-signature-timestamp")
+func (h *WalletHandler) OmiseWebhook(c *fiber.Ctx) error {
 	body := c.Body()
-	if !h.service.VerifyOmiseSignature(h.webhookSecret, signature, timestamp, body) {
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"message": "invalid webhook signature"})
-	}
+	signature, timestamp := omiseWebhookHeaders(c)
 
 	var payload map[string]any
-	if err := c.BodyParser(&payload); err != nil {
+	if err := json.Unmarshal(body, &payload); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "invalid payload"})
+	}
+
+	// Signed webhooks (Dashboard webhook secret configured — headers Omise-Signature + Omise-Signature-Timestamp).
+	if signature != "" {
+		if h.webhookSecret == "" {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"message": "OMISE_WEBHOOK_SECRET is required when Omise sends Omise-Signature",
+			})
+		}
+		if timestamp == "" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"message": "missing Omise-Signature-Timestamp (required together with Omise-Signature)",
+			})
+		}
+		if !h.service.VerifyOmiseSignature(h.webhookSecret, signature, timestamp, body) {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"message": "invalid webhook signature"})
+		}
 	}
 
 	charge, ok := mapper.WebhookPayloadToCharge(payload)
 	if !ok {
 		return c.SendStatus(fiber.StatusOK)
+	}
+
+	// Unsigned: Omise omits signature headers until you add a webhook secret in Test/Live webhooks settings.
+	// Per https://docs.omise.co/api-webhooks#protecting-your-endpoints use event verification (GET charge) instead.
+	if signature == "" {
+		st, paid, err := h.service.FetchChargeStateFromAPI(charge.ChargeID)
+		if err != nil {
+			return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{
+				"message": err.Error(),
+				"hint":    "Either configure a webhook signing secret in Omise Dashboard (recommended), or ensure OMISE_SECRET_KEY can GET /charges for event verification",
+			})
+		}
+		charge.Status = st
+		charge.Paid = paid
 	}
 
 	if err := h.service.ProcessWebhookCharge(charge.ChargeID, charge.Status, charge.Paid); err != nil {

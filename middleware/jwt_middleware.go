@@ -26,6 +26,9 @@ func (m Middleware) JWTMiddleware(c *fiber.Ctx) error {
 	if !ok {
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"message": "invalid token"})
 	}
+	if tu, _ := claims["token_use"].(string); tu == "refresh" {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"message": "use access token"})
+	}
 	sub, _ := claims["sub"].(string)
 	if sub == "" {
 		if v, ok := claims["user_id"].(string); ok {
