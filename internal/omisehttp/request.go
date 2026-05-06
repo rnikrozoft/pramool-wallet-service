@@ -1,6 +1,7 @@
 package omisehttp
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -9,10 +10,14 @@ import (
 
 // Do sends the request with Omise basic auth, reads the body, and returns an error if status is not 2xx.
 // errLabel is prefixed on error messages (e.g. "omise charge failed").
-func Do(client *http.Client, secretKey string, req *http.Request, errLabel string) ([]byte, error) {
+func Do(ctx context.Context, client *http.Client, secretKey string, req *http.Request, errLabel string) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if client == nil {
 		client = http.DefaultClient
 	}
+	req = req.WithContext(ctx)
 	req.SetBasicAuth(strings.TrimSpace(secretKey), "")
 
 	res, err := client.Do(req)

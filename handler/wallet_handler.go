@@ -14,11 +14,10 @@ import (
 type WalletHandler struct {
 	service       *service.WalletService
 	webhookSecret string
-	internalKey   string
 }
 
-func NewWalletHandler(service *service.WalletService, webhookSecret, internalKey string) *WalletHandler {
-	return &WalletHandler{service: service, webhookSecret: webhookSecret, internalKey: strings.TrimSpace(internalKey)}
+func NewWalletHandler(service *service.WalletService, webhookSecret string) *WalletHandler {
+	return &WalletHandler{service: service, webhookSecret: webhookSecret}
 }
 
 func (h *WalletHandler) Topup(c *fiber.Ctx) error {
@@ -28,7 +27,7 @@ func (h *WalletHandler) Topup(c *fiber.Ctx) error {
 	}
 	userID, _ := c.Locals("user_id").(string)
 	in := mapper.TopupRequestToInput(userID, &req)
-	result, err := h.service.CreatePromptPayTopup(in)
+	result, err := h.service.CreatePromptPayTopup(c.UserContext(), in)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"message": err.Error()})
 	}
@@ -107,7 +106,7 @@ func (h *WalletHandler) OmiseWebhook(c *fiber.Ctx) error {
 	// Unsigned: Omise omits signature headers until you add a webhook secret in Test/Live webhooks settings.
 	// Per https://docs.omise.co/api-webhooks#protecting-your-endpoints use event verification (GET charge) instead.
 	if signature == "" {
-		st, paid, err := h.service.FetchChargeStateFromAPI(charge.ChargeID)
+		st, paid, err := h.service.FetchChargeStateFromAPI(c.UserContext(), charge.ChargeID)
 		if err != nil {
 			return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{
 				"message": err.Error(),
@@ -124,20 +123,3 @@ func (h *WalletHandler) OmiseWebhook(c *fiber.Ctx) error {
 	return c.SendStatus(fiber.StatusOK)
 }
 
-func (h *WalletHandler) ChargeAuctionCloseFee(c *fiber.Ctx) error {
-	if h.internalKey == "" || strings.TrimSpace(c.Get("X-Internal-Key")) != h.internalKey {
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"message": "unauthorized internal call"})
-	}
-	var req dto.AuctionCloseFeeRequest
-	if err := c.BodyParser(&req); err != nil || strings.TrimSpace(req.SellerID) == "" || req.Amount <= 0 {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "invalid request"})
-	}
-	creditDeduct := req.Amount
-	if req.CreditDeduct != nil {
-		creditDeduct = *req.CreditDeduct
-	}
-	if err := h.service.ChargeAuctionCloseFee(req.SellerID, req.AuctionID, req.Amount, creditDeduct); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": err.Error()})
-	}
-	return c.Status(fiber.StatusOK).JSON(fiber.Map{"message": "fee charged"})
-}

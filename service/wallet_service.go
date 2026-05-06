@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
@@ -20,16 +21,19 @@ import (
 )
 
 type WalletService struct {
-	repository        *repository.WalletRepository
-	omiseSecretKey    string
-	systemRecipientID string
+	repository     *repository.WalletRepository
+	omiseSecretKey string
+	httpClient     *http.Client
 }
 
-func NewWalletService(omiseSecretKey, systemRecipientID string, repository *repository.WalletRepository) *WalletService {
+func NewWalletService(omiseSecretKey string, repository *repository.WalletRepository, httpClient *http.Client) *WalletService {
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: 90 * time.Second}
+	}
 	return &WalletService{
-		repository:        repository,
-		omiseSecretKey:    strings.TrimSpace(omiseSecretKey),
-		systemRecipientID: strings.TrimSpace(systemRecipientID),
+		repository:     repository,
+		omiseSecretKey: strings.TrimSpace(omiseSecretKey),
+		httpClient:     httpClient,
 	}
 }
 
@@ -37,14 +41,14 @@ func (s *WalletService) NewChargeID() string {
 	return "chrg_local_" + strconv.FormatInt(time.Now().UnixNano(), 10)
 }
 
-func (s *WalletService) CreatePromptPayTopup(in entity.TopupInput) (*entity.TopupResult, error) {
+func (s *WalletService) CreatePromptPayTopup(ctx context.Context, in entity.TopupInput) (*entity.TopupResult, error) {
 	if s.omiseSecretKey == "" {
 		return nil, errors.New("missing omise secret key")
 	}
 	userID := in.UserID
 	amount := in.Amount
 
-	sourceID, qrURL, err := s.createPromptPaySource(amount)
+	sourceID, qrURL, err := s.createPromptPaySource(ctx, amount)
 	if err != nil {
 		return nil, err
 	}
@@ -61,7 +65,7 @@ func (s *WalletService) CreatePromptPayTopup(in entity.TopupInput) (*entity.Topu
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	body, err := omisehttp.Do(http.DefaultClient, s.omiseSecretKey, req, "omise charge failed")
+	body, err := omisehttp.Do(ctx, s.httpClient, s.omiseSecretKey, req, "omise charge failed")
 	if err != nil {
 		return nil, err
 	}
@@ -89,7 +93,7 @@ func (s *WalletService) CreatePromptPayTopup(in entity.TopupInput) (*entity.Topu
 		qrURL = charge.Source.ScannableCode.Image.DownloadURI
 	}
 	if qrURL == "" {
-		qrURL, _ = s.getPromptPayQRFromSource(sourceID)
+		qrURL, _ = s.getPromptPayQRFromSource(ctx, sourceID)
 	}
 	if qrURL == "" {
 		return nil, errors.New("cannot get promptpay qr data from source/charge")
@@ -109,7 +113,7 @@ func (s *WalletService) CreatePromptPayTopup(in entity.TopupInput) (*entity.Topu
 	}, nil
 }
 
-func (s *WalletService) createPromptPaySource(amount int64) (string, string, error) {
+func (s *WalletService) createPromptPaySource(ctx context.Context, amount int64) (string, string, error) {
 	values := url.Values{}
 	values.Set("type", "promptpay")
 	values.Set("amount", fmt.Sprintf("%d", amount*100))
@@ -121,7 +125,7 @@ func (s *WalletService) createPromptPaySource(amount int64) (string, string, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	body, err := omisehttp.Do(http.DefaultClient, s.omiseSecretKey, req, "omise source failed")
+	body, err := omisehttp.Do(ctx, s.httpClient, s.omiseSecretKey, req, "omise source failed")
 	if err != nil {
 		return "", "", err
 	}
@@ -143,13 +147,13 @@ func (s *WalletService) createPromptPaySource(amount int64) (string, string, err
 	return source.ID, source.ScannableCode.Image.DownloadURI, nil
 }
 
-func (s *WalletService) getPromptPayQRFromSource(sourceID string) (string, error) {
+func (s *WalletService) getPromptPayQRFromSource(ctx context.Context, sourceID string) (string, error) {
 	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("https://api.omise.co/sources/%s", sourceID), nil)
 	if err != nil {
 		return "", err
 	}
 
-	body, err := omisehttp.Do(http.DefaultClient, s.omiseSecretKey, req, "omise source status failed")
+	body, err := omisehttp.Do(ctx, s.httpClient, s.omiseSecretKey, req, "omise source status failed")
 	if err != nil {
 		return "", err
 	}
@@ -169,7 +173,7 @@ func (s *WalletService) getPromptPayQRFromSource(sourceID string) (string, error
 
 // FetchChargeStateFromAPI loads charge paid/status from Omise (GET /charges/:id).
 // Use when webhook requests have no Omise-Signature headers — Omise only sends signatures after you configure a webhook secret in the dashboard; otherwise use this event-verification path per https://docs.omise.co/api-webhooks#protecting-your-endpoints
-func (s *WalletService) FetchChargeStateFromAPI(chargeID string) (status string, paid bool, err error) {
+func (s *WalletService) FetchChargeStateFromAPI(ctx context.Context, chargeID string) (status string, paid bool, err error) {
 	chargeID = strings.TrimSpace(chargeID)
 	if chargeID == "" {
 		return "", false, errors.New("empty charge id")
@@ -181,7 +185,7 @@ func (s *WalletService) FetchChargeStateFromAPI(chargeID string) (status string,
 	if err != nil {
 		return "", false, err
 	}
-	body, err := omisehttp.Do(http.DefaultClient, s.omiseSecretKey, req, "omise charge fetch failed")
+	body, err := omisehttp.Do(ctx, s.httpClient, s.omiseSecretKey, req, "omise charge fetch failed")
 	if err != nil {
 		return "", false, err
 	}
@@ -298,52 +302,3 @@ func (s *WalletService) VerifyOmiseSignature(secretBase64, signatureHeader, time
 	return false
 }
 
-func (s *WalletService) createTransfer(recipientID string, amount int64) error {
-	values := url.Values{}
-	values.Set("amount", fmt.Sprintf("%d", amount*100))
-	values.Set("currency", "thb")
-	values.Set("recipient", recipientID)
-
-	req, err := http.NewRequest(http.MethodPost, "https://api.omise.co/transfers", strings.NewReader(values.Encode()))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	_, err = omisehttp.Do(http.DefaultClient, s.omiseSecretKey, req, "omise transfer failed")
-	return err
-}
-
-func (s *WalletService) ChargeAuctionCloseFee(sellerID, auctionID string, transferAmount, creditDeduct int64) error {
-	sellerID = strings.TrimSpace(sellerID)
-	auctionID = strings.TrimSpace(auctionID)
-	if sellerID == "" || auctionID == "" || transferAmount <= 0 {
-		return errors.New("invalid auction close fee payload")
-	}
-	if creditDeduct < 0 {
-		creditDeduct = 0
-	}
-	var affected int64
-	var err error
-	if creditDeduct > 0 {
-		affected, err = s.repository.DeductUserCreditIfEnough(sellerID, creditDeduct)
-		if err != nil {
-			return err
-		}
-		if affected == 0 {
-			return errors.New("insufficient credit for early-close fee")
-		}
-	}
-	if s.omiseSecretKey == "" || s.systemRecipientID == "" {
-		if creditDeduct > 0 {
-			_ = s.repository.AddUserCredit(sellerID, creditDeduct)
-		}
-		return errors.New("missing omise system recipient configuration")
-	}
-	if err := s.createTransfer(s.systemRecipientID, transferAmount); err != nil {
-		if creditDeduct > 0 {
-			_ = s.repository.AddUserCredit(sellerID, creditDeduct)
-		}
-		return err
-	}
-	return nil
-}
