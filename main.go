@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"os"
 	"os/signal"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 	"github.com/rnikrozoft/pramool-wallet-service/handler"
+	"github.com/rnikrozoft/pramool-wallet-service/internal/config"
 	"github.com/rnikrozoft/pramool-wallet-service/internal/telemetry"
 	"github.com/rnikrozoft/pramool-wallet-service/middleware"
 	"github.com/rnikrozoft/pramool-wallet-service/repository"
@@ -42,7 +44,10 @@ func main() {
 		}
 	}()
 
-	dsn := os.Getenv("DATABASE_DSN")
+	dsn, err := postgresDSN()
+	if err != nil {
+		logger.Fatal("database config", zap.Error(err))
+	}
 	jwtSecret := os.Getenv("JWT_SECRET")
 	webhookSecret := strings.Trim(os.Getenv("OMISE_WEBHOOK_SECRET"), "\"' ")
 	port := os.Getenv("PORT")
@@ -75,11 +80,14 @@ func main() {
 
 	walletRepository := repository.NewWalletRepository(conn)
 	omiseHTTP := telemetry.DefaultHTTPClient(90 * time.Second)
-	walletService := service.NewWalletService(os.Getenv("OMISE_SECRET_KEY"), walletRepository, omiseHTTP)
+	feesCfg := config.LoadWalletFeesFromEnv()
+	walletService := service.NewWalletService(os.Getenv("OMISE_SECRET_KEY"), walletRepository, omiseHTTP, feesCfg)
 	walletHandler := handler.NewWalletHandler(walletService, webhookSecret)
 	m := middleware.Middleware{JWTSecret: jwtSecret}
 
+	app.Get("/wallet/fees", walletHandler.FeeRates)
 	app.Post("/wallet/topup", m.JWTMiddleware, walletHandler.Topup)
+	app.Post("/wallet/withdraw", m.JWTMiddleware, walletHandler.Withdraw)
 	app.Get("/wallet/transactions", m.JWTMiddleware, walletHandler.Transactions)
 	app.Post("/webhooks/omise", walletHandler.OmiseWebhook)
 
@@ -99,4 +107,22 @@ func main() {
 	if err := app.ShutdownWithContext(shutdownCtx); err != nil {
 		logger.Error("fiber shutdown", zap.Error(err))
 	}
+}
+
+func postgresDSN() (string, error) {
+	if dsn := strings.TrimSpace(os.Getenv("DATABASE_DSN")); dsn != "" {
+		return dsn, nil
+	}
+	host := strings.TrimSpace(os.Getenv("DATABASE_HOST"))
+	user := strings.TrimSpace(os.Getenv("DATABASE_USERNAME"))
+	pass := os.Getenv("DATABASE_PASSWORD")
+	name := strings.TrimSpace(os.Getenv("DATABASE_NAME"))
+	port := strings.TrimSpace(os.Getenv("DATABASE_PORT"))
+	if host == "" || user == "" || name == "" {
+		return "", fmt.Errorf("set DATABASE_DSN or DATABASE_HOST, DATABASE_USERNAME, DATABASE_NAME")
+	}
+	if port == "" {
+		port = "5432"
+	}
+	return fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable", user, pass, host, port, name), nil
 }

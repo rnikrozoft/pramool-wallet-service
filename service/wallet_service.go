@@ -15,6 +15,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rnikrozoft/pramool-wallet-service/internal/config"
+	"github.com/rnikrozoft/pramool-wallet-service/internal/fees"
+	"github.com/rnikrozoft/pramool-wallet-service/internal/money"
 	"github.com/rnikrozoft/pramool-wallet-service/internal/omisehttp"
 	"github.com/rnikrozoft/pramool-wallet-service/model/entity"
 	"github.com/rnikrozoft/pramool-wallet-service/repository"
@@ -24,9 +27,11 @@ type WalletService struct {
 	repository     *repository.WalletRepository
 	omiseSecretKey string
 	httpClient     *http.Client
+	feesCfg        config.WalletFeesConfig
+	feesCalc       *fees.Calculator
 }
 
-func NewWalletService(omiseSecretKey string, repository *repository.WalletRepository, httpClient *http.Client) *WalletService {
+func NewWalletService(omiseSecretKey string, repository *repository.WalletRepository, httpClient *http.Client, feesCfg config.WalletFeesConfig) *WalletService {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 90 * time.Second}
 	}
@@ -34,6 +39,8 @@ func NewWalletService(omiseSecretKey string, repository *repository.WalletReposi
 		repository:     repository,
 		omiseSecretKey: strings.TrimSpace(omiseSecretKey),
 		httpClient:     httpClient,
+		feesCfg:        feesCfg,
+		feesCalc:       fees.NewCalculator(feesCfg),
 	}
 }
 
@@ -46,15 +53,26 @@ func (s *WalletService) CreatePromptPayTopup(ctx context.Context, in entity.Topu
 		return nil, errors.New("missing omise secret key")
 	}
 	userID := in.UserID
-	amount := in.Amount
+	gross := in.Amount
+	if err := money.ValidatePositiveBaht(gross); err != nil {
+		return nil, err
+	}
+	if gross < s.feesCfg.MinTopupGrossTHB {
+		return nil, fmt.Errorf("minimum top-up is %d baht", s.feesCfg.MinTopupGrossTHB)
+	}
+	fee := s.feesCalc.TopupFee(gross)
+	credit := s.feesCalc.TopupNetCredit(gross)
+	if credit < 1 {
+		return nil, errors.New("amount too small after payment fee")
+	}
 
-	sourceID, qrURL, err := s.createPromptPaySource(ctx, amount)
+	sourceID, qrURL, err := s.createPromptPaySource(ctx, gross)
 	if err != nil {
 		return nil, err
 	}
 
 	values := url.Values{}
-	values.Set("amount", fmt.Sprintf("%d", amount*100))
+	values.Set("amount", fmt.Sprintf("%d", gross*100))
 	values.Set("currency", "thb")
 	values.Set("source", sourceID)
 	values.Set("description", fmt.Sprintf("Topup credits for user %s", userID))
@@ -99,7 +117,7 @@ func (s *WalletService) CreatePromptPayTopup(ctx context.Context, in entity.Topu
 		return nil, errors.New("cannot get promptpay qr data from source/charge")
 	}
 
-	if err := s.repository.InsertTransaction(charge.ID, userID, amount, "pending", false, false); err != nil {
+	if err := s.repository.InsertTransaction(charge.ID, userID, gross, fee, credit, "pending", false, false); err != nil {
 		return nil, err
 	}
 	if err := s.repository.UpdateTransactionStatus(charge.ID, charge.Status, charge.Paid); err != nil {
@@ -107,9 +125,12 @@ func (s *WalletService) CreatePromptPayTopup(ctx context.Context, in entity.Topu
 	}
 
 	return &entity.TopupResult{
-		ChargeID:  charge.ID,
-		QRCodeURL: qrURL,
-		Status:    charge.Status,
+		ChargeID:     charge.ID,
+		QRCodeURL:    qrURL,
+		Status:       charge.Status,
+		PaidAmount:   gross,
+		FeeAmount:    fee,
+		CreditAmount: credit,
 	}, nil
 }
 
@@ -220,7 +241,11 @@ func (s *WalletService) ProcessWebhookCharge(chargeID, status string, paid bool)
 		return err
 	}
 
-	return s.repository.AddUserCredit(topup.UserID, topup.Amount)
+	credit := topup.CreditAmount
+	if credit <= 0 {
+		credit = s.feesCalc.TopupNetCredit(topup.Amount)
+	}
+	return s.repository.AddUserCredit(topup.UserID, credit)
 }
 
 func (s *WalletService) ListCreditActivity(userID string, limit, offset int, filter string) ([]entity.CreditActivityRow, int, error) {

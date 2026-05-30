@@ -14,12 +14,12 @@ func NewWalletRepository(db *sql.DB) *WalletRepository {
 	return &WalletRepository{db: db}
 }
 
-func (r *WalletRepository) InsertTransaction(chargeID, userID string, amount int64, status string, paid, credited bool) error {
+func (r *WalletRepository) InsertTransaction(chargeID, userID string, gross, fee, credit int64, status string, paid, credited bool) error {
 	_, err := r.db.Exec(`
-		INSERT INTO transactions (charge_id, user_id, amount, status, paid, credited)
-		VALUES ($1,$2,$3,$4,$5,$6)
+		INSERT INTO transactions (charge_id, user_id, amount, fee_amount, credit_amount, status, paid, credited)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
 		ON CONFLICT (charge_id) DO NOTHING
-	`, chargeID, userID, amount, status, paid, credited)
+	`, chargeID, userID, gross, fee, credit, status, paid, credited)
 	return err
 }
 
@@ -53,12 +53,16 @@ func (r *WalletRepository) CountCreditActivity(userID string, filter string) (in
 		q = `SELECT COUNT(*)::int FROM transactions WHERE user_id = $1`
 	case "auction":
 		q = `SELECT COUNT(*)::int FROM bid_transactions WHERE user_id = $1`
+	case "withdraw":
+		q = `SELECT COUNT(*)::int FROM withdrawals WHERE user_id = $1`
 	default:
 		q = `
 SELECT COUNT(*)::int FROM (
   SELECT 1 FROM transactions WHERE user_id = $1
   UNION ALL
   SELECT 1 FROM bid_transactions WHERE user_id = $1
+  UNION ALL
+  SELECT 1 FROM withdrawals WHERE user_id = $1
 ) x`
 	}
 	var n int
@@ -74,8 +78,8 @@ func (r *WalletRepository) ListCreditActivity(userID string, limit, offset int, 
 	case "topup":
 		q = `
 SELECT 'topup'::text AS entry_type, t.created_at, t.updated_at,
-  t.charge_id, t.amount, t.status, t.paid, t.credited,
-  NULL::bigint, NULL::text, NULL::text, NULL::bigint, NULL::bigint, NULL::text
+  t.charge_id, t.credit_amount, t.amount, t.fee_amount, t.status, t.paid, t.credited,
+  NULL::bigint, NULL::text, NULL::text, NULL::text, NULL::bigint, NULL::bigint, NULL::text
 FROM transactions t WHERE t.user_id = $1
 ORDER BY t.created_at DESC
 LIMIT $2 OFFSET $3`
@@ -83,8 +87,8 @@ LIMIT $2 OFFSET $3`
 	case "auction":
 		q = `
 SELECT bt.tx_type::text AS entry_type, bt.created_at, NULL::timestamptz AS updated_at,
-  NULL::text, NULL::bigint, NULL::text, NULL::bool, NULL::bool,
-  bt.bid_tx_id, bt.auction_id, COALESCE(a.title, ''),
+  NULL::text, NULL::bigint, NULL::bigint, NULL::bigint, NULL::text, NULL::bool, NULL::bool,
+  bt.bid_tx_id, bt.auction_id, COALESCE(a.title, ''), COALESCE(a.cover_image_url, ''),
   bt.amount, bt.bid_amount, bt.note
 FROM bid_transactions bt
 LEFT JOIN auctions a ON a.auction_id = bt.auction_id
@@ -92,21 +96,62 @@ WHERE bt.user_id = $1
 ORDER BY bt.created_at DESC
 LIMIT $2 OFFSET $3`
 		args = append(args, limit, offset)
+	case "withdraw":
+		q = `
+SELECT 'withdraw'::text AS entry_type, w.created_at, w.updated_at,
+  NULL::text, NULL::bigint, NULL::bigint, NULL::bigint, w.status, NULL::bool, NULL::bool,
+  w.withdrawal_id, NULL::text, NULL::text, NULL::text,
+  -w.amount, NULL::bigint,
+  CONCAT(
+    'ถอนเครดิต ', w.amount::text, ' บาท · ค่าธรรมเนียมโอน ', w.fee_amount::text,
+    ' บาท · รับเข้าบัญชีประมาณ ', w.transfer_amount::text, ' บาท — ',
+    CASE w.status
+      WHEN 'pending_review' THEN 'รอการตรวจสอบ'
+      WHEN 'processing' THEN 'กำลังดำเนินการ'
+      WHEN 'completed' THEN 'เสร็จสิ้น'
+      WHEN 'failed' THEN 'ไม่สำเร็จ'
+      WHEN 'paid' THEN 'เสร็จสิ้น'
+      ELSE COALESCE(w.failure_reason, w.status)
+    END
+  )
+FROM withdrawals w
+WHERE w.user_id = $1
+ORDER BY w.created_at DESC
+LIMIT $2 OFFSET $3`
+		args = append(args, limit, offset)
 	default:
 		q = `
 SELECT * FROM (
   SELECT 'topup'::text AS entry_type, t.created_at, t.updated_at,
-    t.charge_id, t.amount, t.status, t.paid, t.credited,
-    NULL::bigint, NULL::text, NULL::text, NULL::bigint, NULL::bigint, NULL::text
+    t.charge_id, t.credit_amount, t.amount, t.fee_amount, t.status, t.paid, t.credited,
+    NULL::bigint, NULL::text, NULL::text, NULL::text, NULL::bigint, NULL::bigint, NULL::text
   FROM transactions t WHERE t.user_id = $1
   UNION ALL
   SELECT bt.tx_type::text, bt.created_at, NULL::timestamptz,
-    NULL::text, NULL::bigint, NULL::text, NULL::bool, NULL::bool,
-    bt.bid_tx_id, bt.auction_id, COALESCE(a.title, ''),
+    NULL::text, NULL::bigint, NULL::bigint, NULL::bigint, NULL::text, NULL::bool, NULL::bool,
+    bt.bid_tx_id, bt.auction_id, COALESCE(a.title, ''), COALESCE(a.cover_image_url, ''),
     bt.amount, bt.bid_amount, bt.note
   FROM bid_transactions bt
   LEFT JOIN auctions a ON a.auction_id = bt.auction_id
   WHERE bt.user_id = $1
+  UNION ALL
+  SELECT 'withdraw'::text, w.created_at, w.updated_at,
+    NULL::text, NULL::bigint, NULL::bigint, NULL::bigint, w.status, NULL::bool, NULL::bool,
+    w.withdrawal_id, NULL::text, NULL::text, NULL::text,
+    -w.amount, NULL::bigint,
+  CONCAT(
+    'ถอนเครดิต ', w.amount::text, ' บาท · ค่าธรรมเนียมโอน ', w.fee_amount::text,
+    ' บาท · รับเข้าบัญชีประมาณ ', w.transfer_amount::text, ' บาท — ',
+    CASE w.status
+      WHEN 'pending_review' THEN 'รอการตรวจสอบ'
+      WHEN 'processing' THEN 'กำลังดำเนินการ'
+      WHEN 'completed' THEN 'เสร็จสิ้น'
+      WHEN 'failed' THEN 'ไม่สำเร็จ'
+      WHEN 'paid' THEN 'เสร็จสิ้น'
+      ELSE COALESCE(w.failure_reason, w.status)
+    END
+  )
+  FROM withdrawals w WHERE w.user_id = $1
 ) sub
 ORDER BY created_at DESC
 LIMIT $2 OFFSET $3`
@@ -124,8 +169,9 @@ LIMIT $2 OFFSET $3`
 		var row entity.CreditActivityRow
 		if err := rows.Scan(
 			&row.EntryType, &row.CreatedAt, &row.UpdatedAt,
-			&row.ChargeID, &row.TopupAmount, &row.Status, &row.Paid, &row.Credited,
-			&row.BidTxID, &row.AuctionID, &row.AuctionTitle,
+			&row.ChargeID, &row.TopupAmount, &row.TopupPaid, &row.TopupFee,
+			&row.Status, &row.Paid, &row.Credited,
+			&row.BidTxID, &row.AuctionID, &row.AuctionTitle, &row.AuctionCoverImageURL,
 			&row.LedgerAmount, &row.BidAmount, &row.Note,
 		); err != nil {
 			return nil, err
@@ -142,7 +188,10 @@ func (r *WalletRepository) UpdateTransactionStatus(chargeID, status string, paid
 
 func (r *WalletRepository) GetTransactionCreditFields(chargeID string) (entity.Transaction, error) {
 	var item entity.Transaction
-	err := r.db.QueryRow(`SELECT user_id, amount, credited FROM transactions WHERE charge_id=$1`, chargeID).Scan(&item.UserID, &item.Amount, &item.Credited)
+	err := r.db.QueryRow(`
+		SELECT user_id, amount, COALESCE(fee_amount, 0), COALESCE(NULLIF(credit_amount, 0), amount), credited
+		FROM transactions WHERE charge_id=$1
+	`, chargeID).Scan(&item.UserID, &item.Amount, &item.FeeAmount, &item.CreditAmount, &item.Credited)
 	return item, err
 }
 

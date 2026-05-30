@@ -2,6 +2,7 @@ package mapper
 
 import (
 	"database/sql"
+	"strings"
 	"time"
 
 	"github.com/rnikrozoft/pramool-wallet-service/model/dto"
@@ -42,12 +43,15 @@ func CreditActivityRowToItem(row entity.CreditActivityRow) dto.CreditActivityIte
 	}
 	item.ChargeID = ptrSQLString(row.ChargeID)
 	item.TopupAmount = ptrSQLInt64(row.TopupAmount)
+	item.TopupPaid = ptrSQLInt64(row.TopupPaid)
+	item.TopupFee = ptrSQLInt64(row.TopupFee)
 	item.Status = ptrSQLString(row.Status)
 	item.Paid = ptrSQLBool(row.Paid)
 	item.Credited = ptrSQLBool(row.Credited)
 	item.BidTxID = ptrSQLInt64(row.BidTxID)
 	item.AuctionID = ptrSQLString(row.AuctionID)
 	item.AuctionTitle = ptrSQLString(row.AuctionTitle)
+	item.AuctionCoverImageURL = ptrSQLString(row.AuctionCoverImageURL)
 	item.LedgerAmount = ptrSQLInt64(row.LedgerAmount)
 	item.BidAmount = ptrSQLInt64(row.BidAmount)
 	item.Note = ptrSQLString(row.Note)
@@ -69,9 +73,12 @@ func TopupResultToResponse(r *entity.TopupResult) *dto.TopupResponse {
 		return nil
 	}
 	return &dto.TopupResponse{
-		ChargeID:  r.ChargeID,
-		QRCodeURL: r.QRCodeURL,
-		Status:    r.Status,
+		ChargeID:     r.ChargeID,
+		QRCodeURL:    r.QRCodeURL,
+		Status:       r.Status,
+		PaidAmount:   r.PaidAmount,
+		FeeAmount:    r.FeeAmount,
+		CreditAmount: r.CreditAmount,
 	}
 }
 
@@ -81,6 +88,34 @@ func TopupRequestToInput(userID string, req *dto.TopupRequest) entity.TopupInput
 		return entity.TopupInput{UserID: userID}
 	}
 	return entity.TopupInput{UserID: userID, Amount: req.Amount}
+}
+
+// WithdrawRequestToInput maps HTTP input plus authenticated user to a domain withdraw input.
+func WithdrawRequestToInput(userID string, req *dto.WithdrawRequest) entity.WithdrawInput {
+	if req == nil {
+		return entity.WithdrawInput{UserID: userID}
+	}
+	return entity.WithdrawInput{UserID: userID, Amount: req.Amount}
+}
+
+// WithdrawResultToResponse maps domain withdraw outcome to the API response.
+func WithdrawResultToResponse(r *entity.WithdrawResult) *dto.WithdrawResponse {
+	if r == nil {
+		return nil
+	}
+	return &dto.WithdrawResponse{
+		WithdrawalID:      r.WithdrawalID,
+		Amount:            r.Amount,
+		FeeAmount:         r.FeeAmount,
+		TransferAmount:    r.TransferAmount,
+		Status:            r.Status,
+		StatusLabel:       entity.WithdrawStatusLabelTH(r.Status),
+		OmiseTransferID:   r.OmiseTransferID,
+		BalanceAfter:      r.BalanceAfter,
+		BankAccountName:   r.BankAccountName,
+		BankAccountNumber: r.BankAccountNumber,
+		BankCode:          r.BankCode,
+	}
 }
 
 // TransactionToItem maps a stored transaction to an API list item.
@@ -116,6 +151,10 @@ func WebhookPayloadToCharge(payload map[string]any) (entity.WebhookCharge, bool)
 	}
 
 	if objectType == "event" {
+		key, _ := payload["key"].(string)
+		if strings.HasPrefix(key, "transfer.") {
+			return empty, false
+		}
 		if dataMap, ok := payload["data"].(map[string]any); ok {
 			if dataObjectType, _ := dataMap["object"].(string); dataObjectType == "charge" {
 				objectType = dataObjectType
@@ -135,4 +174,55 @@ func WebhookPayloadToCharge(payload map[string]any) (entity.WebhookCharge, bool)
 		return empty, false
 	}
 	return entity.WebhookCharge{ChargeID: chargeID, Status: status, Paid: paid}, true
+}
+
+func transferFieldsFromData(data map[string]any) (id, status string) {
+	if data == nil {
+		return "", ""
+	}
+	if objType, _ := data["object"].(string); objType == "transfer" {
+		id, _ = data["id"].(string)
+		status, _ = data["status"].(string)
+		return strings.TrimSpace(id), strings.TrimSpace(status)
+	}
+	if nested, ok := data["object"].(map[string]any); ok {
+		if objType, _ := nested["object"].(string); objType == "transfer" {
+			id, _ = nested["id"].(string)
+			status, _ = nested["status"].(string)
+		}
+	}
+	return strings.TrimSpace(id), strings.TrimSpace(status)
+}
+
+// WebhookPayloadToTransfer extracts transfer fields from an Omise event webhook.
+func WebhookPayloadToTransfer(payload map[string]any) (entity.WebhookTransfer, bool) {
+	var empty entity.WebhookTransfer
+	if payload == nil {
+		return empty, false
+	}
+	objectType, _ := payload["object"].(string)
+	if objectType == "transfer" {
+		id, status := transferFieldsFromData(payload)
+		if id == "" {
+			return empty, false
+		}
+		return entity.WebhookTransfer{TransferID: id, Status: status}, true
+	}
+	if objectType != "event" {
+		return empty, false
+	}
+	key, _ := payload["key"].(string)
+	key = strings.TrimSpace(key)
+	if !strings.HasPrefix(key, "transfer.") {
+		return empty, false
+	}
+	dataMap, ok := payload["data"].(map[string]any)
+	if !ok {
+		return empty, false
+	}
+	id, status := transferFieldsFromData(dataMap)
+	if id == "" {
+		return empty, false
+	}
+	return entity.WebhookTransfer{TransferID: id, Status: status, EventKey: key}, true
 }

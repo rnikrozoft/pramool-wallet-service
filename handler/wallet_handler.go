@@ -2,12 +2,15 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/rnikrozoft/pramool-wallet-service/mapper"
 	"github.com/rnikrozoft/pramool-wallet-service/model/dto"
+	"github.com/rnikrozoft/pramool-wallet-service/repository"
 	"github.com/rnikrozoft/pramool-wallet-service/service"
 )
 
@@ -20,18 +23,57 @@ func NewWalletHandler(service *service.WalletService, webhookSecret string) *Wal
 	return &WalletHandler{service: service, webhookSecret: webhookSecret}
 }
 
+func (h *WalletHandler) FeeRates(c *fiber.Ctx) error {
+	return c.JSON(h.service.FeeRates())
+}
+
 func (h *WalletHandler) Topup(c *fiber.Ctx) error {
-	var req dto.TopupRequest
-	if err := c.BodyParser(&req); err != nil || req.Amount < 20 {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "invalid amount"})
+	min := h.service.FeeRates().MinTopupGrossTHB
+	amount, err := parseWholeBahtAmountBody(c)
+	if err != nil || amount < min {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"message": fmt.Sprintf("จำนวนเงินต้องเป็นบาทเต็ม ขั้นต่ำ %d บาท", min),
+		})
 	}
 	userID, _ := c.Locals("user_id").(string)
+	req := dto.TopupRequest{Amount: amount}
 	in := mapper.TopupRequestToInput(userID, &req)
 	result, err := h.service.CreatePromptPayTopup(c.UserContext(), in)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"message": err.Error()})
 	}
 	return c.JSON(mapper.TopupResultToResponse(result))
+}
+
+func (h *WalletHandler) Withdraw(c *fiber.Ctx) error {
+	min := h.service.FeeRates().MinWithdrawCreditTHB
+	amount, err := parseWholeBahtAmountBody(c)
+	if err != nil || amount < min {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"message": fmt.Sprintf("จำนวนเงินต้องเป็นบาทเต็ม ขั้นต่ำ %d บาท", min),
+		})
+	}
+	userID, _ := c.Locals("user_id").(string)
+	req := dto.WithdrawRequest{Amount: amount}
+	in := mapper.WithdrawRequestToInput(userID, &req)
+	result, err := h.service.WithdrawCredit(c.UserContext(), in)
+	if err != nil {
+		switch {
+		case errors.Is(err, repository.ErrInsufficientCredit):
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "เครดิตไม่พอ"})
+		case errors.Is(err, repository.ErrMissingBankAccount):
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "กรุณาบันทึกบัญชีธนาคารในโปรไฟล์ก่อนถอนเงิน"})
+		case errors.Is(err, repository.ErrWithdrawalBlocked):
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"message": err.Error()})
+		default:
+			msg := err.Error()
+			if strings.Contains(msg, "withdrawal blocked:") {
+				return c.Status(fiber.StatusConflict).JSON(fiber.Map{"message": strings.TrimPrefix(msg, "withdrawal blocked: ")})
+			}
+			return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"message": msg})
+		}
+	}
+	return c.JSON(mapper.WithdrawResultToResponse(result))
 }
 
 func (h *WalletHandler) Transactions(c *fiber.Ctx) error {
@@ -49,7 +91,7 @@ func (h *WalletHandler) Transactions(c *fiber.Ctx) error {
 		}
 	}
 	filter := strings.TrimSpace(c.Query("filter"))
-	if filter != "topup" && filter != "auction" {
+	if filter != "topup" && filter != "auction" && filter != "withdraw" {
 		filter = "all"
 	}
 	rows, total, err := h.service.ListCreditActivity(userID, limit, offset, filter)
@@ -96,6 +138,24 @@ func (h *WalletHandler) OmiseWebhook(c *fiber.Ctx) error {
 		if !h.service.VerifyOmiseSignature(h.webhookSecret, signature, timestamp, body) {
 			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"message": "invalid webhook signature"})
 		}
+	}
+
+	// Same endpoint for top-up (charge.*) and withdraw (transfer.*) — route by event key.
+	if transfer, ok := mapper.WebhookPayloadToTransfer(payload); ok {
+		if signature == "" {
+			st, err := h.service.FetchTransferStateFromAPI(c.UserContext(), transfer.TransferID)
+			if err != nil {
+				return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{
+					"message": err.Error(),
+					"hint":    "Configure OMISE_WEBHOOK_SECRET or ensure OMISE_SECRET_KEY can GET /transfers for event verification",
+				})
+			}
+			transfer.Status = st
+		}
+		if err := h.service.ProcessWebhookTransfer(c.UserContext(), transfer); err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"message": err.Error()})
+		}
+		return c.SendStatus(fiber.StatusOK)
 	}
 
 	charge, ok := mapper.WebhookPayloadToCharge(payload)

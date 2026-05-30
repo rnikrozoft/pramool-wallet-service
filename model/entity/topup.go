@@ -8,7 +8,10 @@ type TopupInput struct {
 
 // TopupResult is the outcome of creating a PromptPay charge (domain layer; map to dto in handler).
 type TopupResult struct {
-	ChargeID  string
-	QRCodeURL string
-	Status    string
+	ChargeID     string
+	QRCodeURL    string
+	Status       string
+	PaidAmount   int64
+	FeeAmount    int64
+	CreditAmount int64
 }

@@ -6,3 +6,10 @@ type WebhookCharge struct {
 	Status   string
 	Paid     bool
 }
+
+// WebhookTransfer is normalized Omise transfer data from a webhook event.
+type WebhookTransfer struct {
+	TransferID string
+	Status     string
+	EventKey   string
+}
