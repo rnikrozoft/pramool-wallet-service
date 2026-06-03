@@ -50,7 +50,7 @@ func WithdrawStatusFromWebhookEvent(eventKey, omiseStatus string) (string, bool)
 	switch eventKey {
 	case "transfer.pay":
 		return WithdrawStatusCompleted, true
-	case "transfer.fail":
+	case "transfer.fail", "transfer.destroy":
 		return WithdrawStatusFailed, true
 	case "transfer.create", "transfer.send", "transfer.update":
 		return WithdrawStatusProcessing, true

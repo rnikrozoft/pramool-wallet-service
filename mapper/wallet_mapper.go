@@ -79,6 +79,28 @@ func TopupResultToResponse(r *entity.TopupResult) *dto.TopupResponse {
 		PaidAmount:   r.PaidAmount,
 		FeeAmount:    r.FeeAmount,
 		CreditAmount: r.CreditAmount,
+		ExpiresAt:    r.ExpiresAt,
+		Resumed:      r.Resumed,
+	}
+}
+
+// TopupStatusToResponse maps synced top-up status to the API response.
+func TopupStatusToResponse(r *entity.TopupStatusResult) *dto.TopupStatusResponse {
+	if r == nil {
+		return nil
+	}
+	return &dto.TopupStatusResponse{
+		ChargeID:     r.ChargeID,
+		QRCodeURL:    r.QRCodeURL,
+		Status:       r.Status,
+		Paid:         r.Paid,
+		Credited:     r.Credited,
+		Expired:       r.Expired,
+		ExpiresAt:     r.ExpiresAt,
+		DisputeStatus: r.DisputeStatus,
+		PaidAmount:    r.PaidAmount,
+		FeeAmount:    r.FeeAmount,
+		CreditAmount: r.CreditAmount,
 	}
 }
 
@@ -152,7 +174,7 @@ func WebhookPayloadToCharge(payload map[string]any) (entity.WebhookCharge, bool)
 
 	if objectType == "event" {
 		key, _ := payload["key"].(string)
-		if strings.HasPrefix(key, "transfer.") {
+		if strings.HasPrefix(key, "transfer.") || strings.HasPrefix(key, "dispute.") {
 			return empty, false
 		}
 		if dataMap, ok := payload["data"].(map[string]any); ok {
@@ -225,4 +247,77 @@ func WebhookPayloadToTransfer(payload map[string]any) (entity.WebhookTransfer, b
 		return empty, false
 	}
 	return entity.WebhookTransfer{TransferID: id, Status: status, EventKey: key}, true
+}
+
+func disputeFieldsFromData(data map[string]any) (id, chargeID, status string) {
+	if data == nil {
+		return "", "", ""
+	}
+	if objType, _ := data["object"].(string); objType == "dispute" {
+		id, _ = data["id"].(string)
+		status, _ = data["status"].(string)
+		chargeID = chargeIDFromDisputeData(data)
+		return strings.TrimSpace(id), strings.TrimSpace(chargeID), strings.TrimSpace(status)
+	}
+	if nested, ok := data["object"].(map[string]any); ok {
+		if objType, _ := nested["object"].(string); objType == "dispute" {
+			id, _ = nested["id"].(string)
+			status, _ = nested["status"].(string)
+			chargeID = chargeIDFromDisputeData(nested)
+		}
+	}
+	return strings.TrimSpace(id), strings.TrimSpace(chargeID), strings.TrimSpace(status)
+}
+
+func chargeIDFromDisputeData(data map[string]any) string {
+	if data == nil {
+		return ""
+	}
+	switch ch := data["charge"].(type) {
+	case string:
+		return strings.TrimSpace(ch)
+	case map[string]any:
+		id, _ := ch["id"].(string)
+		return strings.TrimSpace(id)
+	default:
+		return ""
+	}
+}
+
+// WebhookPayloadToDispute extracts dispute fields from an Omise event webhook.
+func WebhookPayloadToDispute(payload map[string]any) (entity.WebhookDispute, bool) {
+	var empty entity.WebhookDispute
+	if payload == nil {
+		return empty, false
+	}
+	objectType, _ := payload["object"].(string)
+	if objectType == "dispute" {
+		id, chargeID, status := disputeFieldsFromData(payload)
+		if id == "" {
+			return empty, false
+		}
+		return entity.WebhookDispute{DisputeID: id, ChargeID: chargeID, Status: status}, true
+	}
+	if objectType != "event" {
+		return empty, false
+	}
+	key, _ := payload["key"].(string)
+	key = strings.TrimSpace(key)
+	if !strings.HasPrefix(key, "dispute.") {
+		return empty, false
+	}
+	dataMap, ok := payload["data"].(map[string]any)
+	if !ok {
+		return empty, false
+	}
+	id, chargeID, status := disputeFieldsFromData(dataMap)
+	if id == "" {
+		return empty, false
+	}
+	return entity.WebhookDispute{
+		DisputeID: id,
+		ChargeID:  chargeID,
+		Status:    status,
+		EventKey:  key,
+	}, true
 }

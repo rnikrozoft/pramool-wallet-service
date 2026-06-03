@@ -1,12 +1,19 @@
 package middleware
 
 import (
+	"context"
+
 	"github.com/gofiber/fiber/v2"
 	"github.com/golang-jwt/jwt/v5"
 )
 
+type UserSuspensionChecker interface {
+	IsUserSuspended(ctx context.Context, subject string) (bool, error)
+}
+
 type Middleware struct {
-	JWTSecret string
+	JWTSecret         string
+	SuspensionChecker UserSuspensionChecker
 }
 
 func (m Middleware) JWTMiddleware(c *fiber.Ctx) error {

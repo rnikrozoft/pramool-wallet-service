@@ -8,6 +8,23 @@ type TopupResponse struct {
 	PaidAmount   int64  `json:"paid_amount"`
 	FeeAmount    int64  `json:"fee_amount"`
 	CreditAmount int64  `json:"credit_amount"`
+	ExpiresAt    string `json:"expires_at,omitempty"`
+	Resumed      bool   `json:"resumed,omitempty"`
+}
+
+// TopupStatusResponse is returned by GET /wallet/topup/status after syncing with Omise.
+type TopupStatusResponse struct {
+	ChargeID     string `json:"charge_id"`
+	QRCodeURL    string `json:"qr_code_url,omitempty"`
+	Status       string `json:"status"`
+	Paid         bool   `json:"paid"`
+	Credited     bool   `json:"credited"`
+	Expired      bool   `json:"expired"`
+	ExpiresAt    string `json:"expires_at,omitempty"`
+	DisputeStatus string `json:"dispute_status,omitempty"`
+	PaidAmount   int64  `json:"paid_amount"`
+	FeeAmount    int64  `json:"fee_amount"`
+	CreditAmount int64  `json:"credit_amount"`
 }
 
 // FeeRatesResponse documents user-borne Omise fees and platform commission (for UI).

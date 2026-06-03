@@ -25,11 +25,18 @@ func (s *WalletService) WithdrawCredit(ctx context.Context, in entity.WithdrawIn
 	if err := money.ValidatePositiveBaht(amount); err != nil {
 		return nil, err
 	}
-	if amount < s.feesCfg.MinWithdrawCreditTHB {
-		return nil, fmt.Errorf("minimum withdrawal is %d baht", s.feesCfg.MinWithdrawCreditTHB)
+	banned, err := s.repository.IsUserBanned(ctx, userID)
+	if err != nil {
+		return nil, err
 	}
-	fee := s.feesCfg.OmiseTransferFeeTHB
-	transferAmount := s.feesCalc.WithdrawNetTransfer(amount)
+	if banned {
+		return nil, repository.ErrWithdrawBanned
+	}
+	if amount < s.fees(ctx).MinWithdrawCreditTHB {
+		return nil, fmt.Errorf("minimum withdrawal is %d baht", s.fees(ctx).MinWithdrawCreditTHB)
+	}
+	fee := s.fees(ctx).OmiseTransferFeeTHB
+	transferAmount := s.feesCalc(ctx).WithdrawNetTransfer(amount)
 	if transferAmount < 1 {
 		return nil, fmt.Errorf("amount must exceed transfer fee (%d baht)", fee)
 	}
@@ -41,16 +48,19 @@ func (s *WalletService) WithdrawCredit(ctx context.Context, in entity.WithdrawIn
 	if err := repository.ValidatePayoutProfile(profile); err != nil {
 		return nil, err
 	}
+	if profile.Credit < 0 {
+		return nil, repository.ErrCreditDebt
+	}
 	if profile.Credit < amount {
 		return nil, repository.ErrInsufficientCredit
 	}
 
-	sellerN, buyerN, err := s.repository.CountUserFulfillmentBlocks(ctx, userID)
+	sellerN, err := s.repository.CountUserFulfillmentBlocks(ctx, userID)
 	if err != nil {
 		return nil, err
 	}
-	if sellerN > 0 || buyerN > 0 {
-		return nil, fmt.Errorf("%w: %s", repository.ErrWithdrawalBlocked, repository.WithdrawalBlockedReason(sellerN, buyerN))
+	if sellerN > 0 {
+		return nil, fmt.Errorf("%w: %s", repository.ErrWithdrawalBlocked, repository.WithdrawalBlockedReason(sellerN))
 	}
 
 	brand, ok := omiseBankBrand(profile.BankCode)

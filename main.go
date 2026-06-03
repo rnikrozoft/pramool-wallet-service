@@ -16,7 +16,6 @@ import (
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 	"github.com/rnikrozoft/pramool-wallet-service/handler"
-	"github.com/rnikrozoft/pramool-wallet-service/internal/config"
 	"github.com/rnikrozoft/pramool-wallet-service/internal/telemetry"
 	"github.com/rnikrozoft/pramool-wallet-service/middleware"
 	"github.com/rnikrozoft/pramool-wallet-service/repository"
@@ -79,17 +78,30 @@ func main() {
 	}))
 
 	walletRepository := repository.NewWalletRepository(conn)
+	platformSettingsRepo := repository.NewPlatformSettingsRepository(conn)
 	omiseHTTP := telemetry.DefaultHTTPClient(90 * time.Second)
-	feesCfg := config.LoadWalletFeesFromEnv()
-	walletService := service.NewWalletService(os.Getenv("OMISE_SECRET_KEY"), walletRepository, omiseHTTP, feesCfg)
+	feesLoader, err := service.NewWalletFeesLoader(context.Background(), platformSettingsRepo)
+	if err != nil {
+		logger.Fatal("platform_settings", zap.Error(err))
+	}
+	walletService := service.NewWalletService(os.Getenv("OMISE_SECRET_KEY"), walletRepository, omiseHTTP, feesLoader)
 	walletHandler := handler.NewWalletHandler(walletService, webhookSecret)
+	platformHandler := handler.NewPlatformHandler(walletService, strings.TrimSpace(os.Getenv("PLATFORM_OMISE_RECIPIENT_ID")))
 	m := middleware.Middleware{JWTSecret: jwtSecret}
+	internalSecret := strings.TrimSpace(os.Getenv("INTERNAL_API_SECRET"))
 
 	app.Get("/wallet/fees", walletHandler.FeeRates)
+	app.Get("/wallet/topup/status", m.JWTMiddleware, walletHandler.TopupStatus)
+	app.Get("/wallet/topup/pending", m.JWTMiddleware, walletHandler.PendingTopup)
 	app.Post("/wallet/topup", m.JWTMiddleware, walletHandler.Topup)
 	app.Post("/wallet/withdraw", m.JWTMiddleware, walletHandler.Withdraw)
 	app.Get("/wallet/transactions", m.JWTMiddleware, walletHandler.Transactions)
 	app.Post("/webhooks/omise", walletHandler.OmiseWebhook)
+
+	adminInternal := app.Group("/admin", middleware.InternalAuth(internalSecret))
+	adminInternal.Get("/platform/revenue", platformHandler.Revenue)
+	adminInternal.Post("/platform/withdraw", platformHandler.Withdraw)
+	adminInternal.Get("/platform/withdrawals", platformHandler.ListWithdrawals)
 
 	addr := ":" + port
 	go func() {

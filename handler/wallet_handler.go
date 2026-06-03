@@ -24,11 +24,11 @@ func NewWalletHandler(service *service.WalletService, webhookSecret string) *Wal
 }
 
 func (h *WalletHandler) FeeRates(c *fiber.Ctx) error {
-	return c.JSON(h.service.FeeRates())
+	return c.JSON(h.service.FeeRates(c.UserContext()))
 }
 
 func (h *WalletHandler) Topup(c *fiber.Ctx) error {
-	min := h.service.FeeRates().MinTopupGrossTHB
+	min := h.service.FeeRates(c.UserContext()).MinTopupGrossTHB
 	amount, err := parseWholeBahtAmountBody(c)
 	if err != nil || amount < min {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -40,13 +40,52 @@ func (h *WalletHandler) Topup(c *fiber.Ctx) error {
 	in := mapper.TopupRequestToInput(userID, &req)
 	result, err := h.service.CreatePromptPayTopup(c.UserContext(), in)
 	if err != nil {
+		if errors.Is(err, repository.ErrTopupBanned) {
+			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"message": "บัญชีถูกจำกัด ไม่สามารถเติมเงินได้"})
+		}
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"message": err.Error()})
 	}
 	return c.JSON(mapper.TopupResultToResponse(result))
 }
 
+func (h *WalletHandler) TopupStatus(c *fiber.Ctx) error {
+	chargeID := strings.TrimSpace(c.Query("charge_id"))
+	if chargeID == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "ต้องระบุ charge_id"})
+	}
+	userID, _ := c.Locals("user_id").(string)
+	result, err := h.service.SyncTopupChargeStatus(c.UserContext(), userID, chargeID)
+	if err != nil {
+		msg := err.Error()
+		if strings.Contains(msg, "ไม่พบรายการ") {
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"message": msg})
+		}
+		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"message": msg})
+	}
+	return c.JSON(mapper.TopupStatusToResponse(result))
+}
+
+func (h *WalletHandler) PendingTopup(c *fiber.Ctx) error {
+	min := h.service.FeeRates(c.UserContext()).MinTopupGrossTHB
+	amount, err := parseWholeBahtAmountQuery(c, "amount")
+	if err != nil || amount < min {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"message": fmt.Sprintf("จำนวนเงินต้องเป็นบาทเต็ม ขั้นต่ำ %d บาท", min),
+		})
+	}
+	userID, _ := c.Locals("user_id").(string)
+	result, ok, err := h.service.TryResumePendingTopup(c.UserContext(), userID, amount)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"message": err.Error()})
+	}
+	if !ok || result == nil {
+		return c.SendStatus(fiber.StatusNoContent)
+	}
+	return c.JSON(mapper.TopupResultToResponse(result))
+}
+
 func (h *WalletHandler) Withdraw(c *fiber.Ctx) error {
-	min := h.service.FeeRates().MinWithdrawCreditTHB
+	min := h.service.FeeRates(c.UserContext()).MinWithdrawCreditTHB
 	amount, err := parseWholeBahtAmountBody(c)
 	if err != nil || amount < min {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -59,12 +98,16 @@ func (h *WalletHandler) Withdraw(c *fiber.Ctx) error {
 	result, err := h.service.WithdrawCredit(c.UserContext(), in)
 	if err != nil {
 		switch {
+		case errors.Is(err, repository.ErrCreditDebt):
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"message": "คุณมียอดค้างชำระ กรุณาเติมเครดิตให้ครบก่อนถอนเงิน"})
 		case errors.Is(err, repository.ErrInsufficientCredit):
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "เครดิตไม่พอ"})
 		case errors.Is(err, repository.ErrMissingBankAccount):
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "กรุณาบันทึกบัญชีธนาคารในโปรไฟล์ก่อนถอนเงิน"})
 		case errors.Is(err, repository.ErrWithdrawalBlocked):
 			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"message": err.Error()})
+		case errors.Is(err, repository.ErrWithdrawBanned):
+			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"message": "บัญชีถูกระงับ ไม่สามารถถอนเงินได้"})
 		default:
 			msg := err.Error()
 			if strings.Contains(msg, "withdrawal blocked:") {
@@ -94,7 +137,12 @@ func (h *WalletHandler) Transactions(c *fiber.Ctx) error {
 	if filter != "topup" && filter != "auction" && filter != "withdraw" {
 		filter = "all"
 	}
-	rows, total, err := h.service.ListCreditActivity(userID, limit, offset, filter)
+	sortKey := strings.TrimSpace(c.Query("sort"))
+	sortOrder := strings.TrimSpace(c.Query("order"))
+	if sortOrder != "asc" {
+		sortOrder = "desc"
+	}
+	rows, total, err := h.service.ListCreditActivity(userID, limit, offset, filter, sortKey, sortOrder)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"message": err.Error()})
 	}
@@ -142,7 +190,9 @@ func (h *WalletHandler) OmiseWebhook(c *fiber.Ctx) error {
 
 	// Same endpoint for top-up (charge.*) and withdraw (transfer.*) — route by event key.
 	if transfer, ok := mapper.WebhookPayloadToTransfer(payload); ok {
-		if signature == "" {
+		// transfer.destroy removes the object from Omise — GET /transfers/:id returns 404.
+		skipAPIVerify := transfer.EventKey == "transfer.destroy"
+		if signature == "" && !skipAPIVerify {
 			st, err := h.service.FetchTransferStateFromAPI(c.UserContext(), transfer.TransferID)
 			if err != nil {
 				return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{
@@ -153,6 +203,26 @@ func (h *WalletHandler) OmiseWebhook(c *fiber.Ctx) error {
 			transfer.Status = st
 		}
 		if err := h.service.ProcessWebhookTransfer(c.UserContext(), transfer); err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"message": err.Error()})
+		}
+		return c.SendStatus(fiber.StatusOK)
+	}
+
+	if dispute, ok := mapper.WebhookPayloadToDispute(payload); ok {
+		if signature == "" {
+			st, chargeID, err := h.service.FetchDisputeStateFromAPI(c.UserContext(), dispute.DisputeID)
+			if err != nil {
+				return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{
+					"message": err.Error(),
+					"hint":    "Configure OMISE_WEBHOOK_SECRET or ensure OMISE_SECRET_KEY can GET /disputes for event verification",
+				})
+			}
+			dispute.Status = st
+			if dispute.ChargeID == "" {
+				dispute.ChargeID = chargeID
+			}
+		}
+		if err := h.service.ProcessWebhookDispute(c.UserContext(), dispute); err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"message": err.Error()})
 		}
 		return c.SendStatus(fiber.StatusOK)

@@ -12,6 +12,7 @@ func TestWithdrawStatusFromWebhookEvent(t *testing.T) {
 		{"transfer.send", WithdrawStatusProcessing, true},
 		{"transfer.pay", WithdrawStatusCompleted, true},
 		{"transfer.fail", WithdrawStatusFailed, true},
+		{"transfer.destroy", WithdrawStatusFailed, true},
 		{"recipient.verify", "", false},
 	}
 	for _, c := range cases {

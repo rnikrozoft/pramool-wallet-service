@@ -12,8 +12,11 @@ import (
 
 var (
 	ErrInsufficientCredit = errors.New("insufficient credit")
+	ErrCreditDebt         = errors.New("credit debt")
 	ErrMissingBankAccount = errors.New("missing bank account")
 	ErrWithdrawalBlocked  = errors.New("withdrawal blocked")
+	ErrWithdrawBanned     = errors.New("account banned from withdrawing")
+	ErrTopupBanned        = errors.New("account banned from topping up")
 )
 
 // GetUserPayoutProfile loads credit and bank fields for payout.
@@ -45,23 +48,18 @@ func (r *WalletRepository) GetUserPayoutProfile(ctx context.Context, userID stri
 }
 
 // CountUserFulfillmentBlocks mirrors pramool-core escrow gating for withdrawals.
-func (r *WalletRepository) CountUserFulfillmentBlocks(ctx context.Context, userID string) (pendingSellerShip, pendingBuyerConfirm int, err error) {
+func (r *WalletRepository) CountUserFulfillmentBlocks(ctx context.Context, userID string) (pendingSellerShip int, err error) {
 	err = r.db.QueryRowContext(ctx, `
 		SELECT
 			(SELECT COUNT(*)::int FROM auctions a
 			 WHERE a.status = 'closed'
 			   AND a.seller_payout_at IS NULL
-			   AND COALESCE(NULLIF(TRIM(a.winner_id), ''), '') <> ''
+			   AND a.winner_id IS NOT NULL
 			   AND a.seller_id = $1
-			   AND a.seller_shipped_at IS NULL),
-			(SELECT COUNT(*)::int FROM auctions a
-			 WHERE a.status = 'closed'
-			   AND a.seller_payout_at IS NULL
-			   AND COALESCE(NULLIF(TRIM(a.winner_id), ''), '') <> ''
-			   AND a.winner_id = $1
-			   AND a.buyer_received_at IS NULL)
-	`, userID).Scan(&pendingSellerShip, &pendingBuyerConfirm)
-	return pendingSellerShip, pendingBuyerConfirm, err
+			   AND a.seller_shipped_at IS NULL
+			   AND a.buyer_escrow_refunded_at IS NULL)
+	`, userID).Scan(&pendingSellerShip)
+	return pendingSellerShip, err
 }
 
 // ReserveWithdrawal deducts credit and inserts a pending withdrawal row.
@@ -218,18 +216,11 @@ func (r *WalletRepository) SetUserOmiseRecipientID(ctx context.Context, userID, 
 }
 
 // WithdrawalBlockedReason builds a Thai message from fulfillment block counts.
-func WithdrawalBlockedReason(sellerN, buyerN int) string {
-	if sellerN == 0 && buyerN == 0 {
+func WithdrawalBlockedReason(pendingSellerShip int) string {
+	if pendingSellerShip == 0 {
 		return ""
 	}
-	var parts []string
-	if sellerN > 0 {
-		parts = append(parts, "กรุณาบันทึกการจัดส่งสินค้าให้ครบในฐานะผู้ขาย")
-	}
-	if buyerN > 0 {
-		parts = append(parts, "กรุณายืนยันรับของให้ครบในฐานะผู้ชนะประมูล")
-	}
-	return strings.Join(parts, " และ ") + " ก่อนจึงจะถอนเงินได้"
+	return "กรุณาบันทึกการจัดส่งสินค้าให้ครบในฐานะผู้ขาย ก่อนจึงจะถอนเงินได้"
 }
 
 // ValidatePayoutProfile checks bank fields required for Omise transfer.

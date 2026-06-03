@@ -55,8 +55,13 @@ func (s *WalletService) ProcessWebhookTransfer(ctx context.Context, in entity.We
 
 	if newStatus == entity.WithdrawStatusFailed {
 		reason := "omise transfer failed"
-		if omiseStatus != "" {
-			reason = "omise transfer failed: " + omiseStatus
+		switch key {
+		case "transfer.destroy":
+			reason = "omise transfer cancelled"
+		default:
+			if omiseStatus != "" {
+				reason = "omise transfer failed: " + omiseStatus
+			}
 		}
 		return s.repository.FailWithdrawalByTransferID(ctx, transferID, reason)
 	}

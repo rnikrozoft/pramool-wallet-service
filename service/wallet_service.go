@@ -27,11 +27,10 @@ type WalletService struct {
 	repository     *repository.WalletRepository
 	omiseSecretKey string
 	httpClient     *http.Client
-	feesCfg        config.WalletFeesConfig
-	feesCalc       *fees.Calculator
+	feesLoader     *WalletFeesLoader
 }
 
-func NewWalletService(omiseSecretKey string, repository *repository.WalletRepository, httpClient *http.Client, feesCfg config.WalletFeesConfig) *WalletService {
+func NewWalletService(omiseSecretKey string, repository *repository.WalletRepository, httpClient *http.Client, feesLoader *WalletFeesLoader) *WalletService {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 90 * time.Second}
 	}
@@ -39,9 +38,16 @@ func NewWalletService(omiseSecretKey string, repository *repository.WalletReposi
 		repository:     repository,
 		omiseSecretKey: strings.TrimSpace(omiseSecretKey),
 		httpClient:     httpClient,
-		feesCfg:        feesCfg,
-		feesCalc:       fees.NewCalculator(feesCfg),
+		feesLoader:     feesLoader,
 	}
+}
+
+func (s *WalletService) fees(ctx context.Context) config.WalletFeesConfig {
+	return s.feesLoader.MustGet(ctx)
+}
+
+func (s *WalletService) feesCalc(ctx context.Context) *fees.Calculator {
+	return fees.NewCalculator(s.fees(ctx))
 }
 
 func (s *WalletService) NewChargeID() string {
@@ -52,20 +58,220 @@ func (s *WalletService) CreatePromptPayTopup(ctx context.Context, in entity.Topu
 	if s.omiseSecretKey == "" {
 		return nil, errors.New("missing omise secret key")
 	}
-	userID := in.UserID
+	userID := strings.TrimSpace(in.UserID)
 	gross := in.Amount
 	if err := money.ValidatePositiveBaht(gross); err != nil {
 		return nil, err
 	}
-	if gross < s.feesCfg.MinTopupGrossTHB {
-		return nil, fmt.Errorf("minimum top-up is %d baht", s.feesCfg.MinTopupGrossTHB)
+	if gross < s.fees(ctx).MinTopupGrossTHB {
+		return nil, fmt.Errorf("minimum top-up is %d baht", s.fees(ctx).MinTopupGrossTHB)
 	}
-	fee := s.feesCalc.TopupFee(gross)
-	credit := s.feesCalc.TopupNetCredit(gross)
+	banned, err := s.repository.IsUserBanned(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	if banned {
+		return nil, repository.ErrTopupBanned
+	}
+	fee := s.feesCalc(ctx).TopupFee(gross)
+	credit := s.feesCalc(ctx).TopupNetCredit(gross)
 	if credit < 1 {
 		return nil, errors.New("amount too small after payment fee")
 	}
 
+	if res, ok, err := s.tryResumePendingTopup(ctx, userID, gross, fee, credit); err != nil {
+		return nil, err
+	} else if ok {
+		return res, nil
+	}
+	return s.createNewPromptPayTopup(ctx, userID, gross, fee, credit)
+}
+
+// TryResumePendingTopup returns an existing Omise charge QR when the user still has an unpaid top-up for the same amount.
+func (s *WalletService) TryResumePendingTopup(ctx context.Context, userID string, gross int64) (*entity.TopupResult, bool, error) {
+	if err := money.ValidatePositiveBaht(gross); err != nil {
+		return nil, false, err
+	}
+	if gross < s.fees(ctx).MinTopupGrossTHB {
+		return nil, false, fmt.Errorf("minimum top-up is %d baht", s.fees(ctx).MinTopupGrossTHB)
+	}
+	fee := s.feesCalc(ctx).TopupFee(gross)
+	credit := s.feesCalc(ctx).TopupNetCredit(gross)
+	return s.tryResumePendingTopup(ctx, strings.TrimSpace(userID), gross, fee, credit)
+}
+
+// SyncTopupChargeStatus loads charge state from Omise, updates the local row, and returns the current status.
+func (s *WalletService) SyncTopupChargeStatus(ctx context.Context, userID, chargeID string) (*entity.TopupStatusResult, error) {
+	userID = strings.TrimSpace(userID)
+	chargeID = strings.TrimSpace(chargeID)
+	if chargeID == "" {
+		return nil, errors.New("empty charge id")
+	}
+	row, err := s.repository.GetTopupTransaction(userID, chargeID)
+	if err != nil {
+		return nil, err
+	}
+	if row == nil {
+		return nil, errors.New("ไม่พบรายการเติมเงิน")
+	}
+
+	details, err := s.fetchChargeDetails(ctx, chargeID)
+	if err != nil {
+		return nil, err
+	}
+
+	if details.Paid && strings.EqualFold(details.Status, "successful") {
+		if err := s.ProcessWebhookCharge(chargeID, details.Status, details.Paid); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := s.repository.UpdateTransactionStatus(chargeID, details.Status, details.Paid); err != nil {
+			return nil, err
+		}
+	}
+
+	updated, err := s.repository.GetTopupTransaction(userID, chargeID)
+	if err != nil {
+		return nil, err
+	}
+	if updated == nil {
+		return nil, errors.New("ไม่พบรายการเติมเงิน")
+	}
+
+	if details.DisputeID != "" || details.DisputeStatus != "" {
+		if err := s.applyChargeDisputeFromDetails(chargeID, details); err != nil {
+			return nil, err
+		}
+		updated, err = s.repository.GetTopupTransaction(userID, chargeID)
+		if err != nil {
+			return nil, err
+		}
+		if updated == nil {
+			return nil, errors.New("ไม่พบรายการเติมเงิน")
+		}
+		details.DisputeID = updated.DisputeID
+		details.DisputeStatus = updated.DisputeStatus
+	}
+
+	return topupStatusFromRow(updated, details), nil
+}
+
+func topupStatusFromRow(row *entity.Transaction, details omiseChargeDetails) *entity.TopupStatusResult {
+	feeAmt := row.FeeAmount
+	creditAmt := row.CreditAmount
+	if feeAmt <= 0 {
+		feeAmt = 0
+	}
+	if creditAmt <= 0 {
+		creditAmt = row.Amount
+	}
+	qrURL := strings.TrimSpace(row.QRCodeURL)
+	if qrURL == "" {
+		qrURL = strings.TrimSpace(details.QRURL)
+	}
+	expired := details.Expired || strings.EqualFold(strings.TrimSpace(details.Status), "expired")
+	disputeStatus := strings.TrimSpace(row.DisputeStatus)
+	if disputeStatus == "" {
+		disputeStatus = strings.TrimSpace(details.DisputeStatus)
+	}
+	status := strings.TrimSpace(row.Status)
+	if status == "" {
+		status = strings.TrimSpace(details.Status)
+	}
+	return &entity.TopupStatusResult{
+		ChargeID:      row.ChargeID,
+		QRCodeURL:     qrURL,
+		Status:        status,
+		Paid:          details.Paid || row.Paid,
+		Credited:      row.Credited,
+		Expired:       expired,
+		ExpiresAt:     details.ExpiresAt,
+		DisputeStatus: disputeStatus,
+		PaidAmount:    row.Amount,
+		FeeAmount:     feeAmt,
+		CreditAmount:  creditAmt,
+	}
+}
+
+func (s *WalletService) tryResumePendingTopup(ctx context.Context, userID string, gross, fee, credit int64) (*entity.TopupResult, bool, error) {
+	row, err := s.repository.FindLatestPendingTopup(userID, gross)
+	if err != nil || row == nil {
+		return nil, false, err
+	}
+
+	details, err := s.fetchChargeDetails(ctx, row.ChargeID)
+	if err != nil {
+		return nil, false, nil
+	}
+
+	_ = s.repository.UpdateTransactionStatus(row.ChargeID, details.Status, details.Paid)
+
+	if details.Paid && details.Status == "successful" {
+		_ = s.ProcessWebhookCharge(row.ChargeID, details.Status, details.Paid)
+		return &entity.TopupResult{
+			ChargeID:     row.ChargeID,
+			QRCodeURL:    row.QRCodeURL,
+			Status:       details.Status,
+			PaidAmount:   row.Amount,
+			FeeAmount:    row.FeeAmount,
+			CreditAmount: row.CreditAmount,
+			ExpiresAt:    details.ExpiresAt,
+			Resumed:      true,
+		}, true, nil
+	}
+
+	if topupChargeTerminal(details.Status, details.Paid) {
+		return nil, false, nil
+	}
+
+	qrURL := strings.TrimSpace(details.QRURL)
+	if qrURL == "" {
+		qrURL = strings.TrimSpace(row.QRCodeURL)
+	}
+	if qrURL == "" && details.SourceID != "" {
+		qrURL, _ = s.getPromptPayQRFromSource(ctx, details.SourceID)
+	}
+	if qrURL == "" {
+		return nil, false, nil
+	}
+	if qrURL != row.QRCodeURL {
+		_ = s.repository.UpdateTransactionQRCode(row.ChargeID, qrURL)
+	}
+
+	feeAmt := row.FeeAmount
+	if feeAmt <= 0 {
+		feeAmt = fee
+	}
+	creditAmt := row.CreditAmount
+	if creditAmt <= 0 {
+		creditAmt = credit
+	}
+
+	return &entity.TopupResult{
+		ChargeID:     row.ChargeID,
+		QRCodeURL:    qrURL,
+		Status:       details.Status,
+		PaidAmount:   row.Amount,
+		FeeAmount:    feeAmt,
+		CreditAmount: creditAmt,
+		ExpiresAt:    details.ExpiresAt,
+		Resumed:      true,
+	}, true, nil
+}
+
+func topupChargeTerminal(status string, paid bool) bool {
+	if paid && strings.EqualFold(strings.TrimSpace(status), "successful") {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "failed", "expired", "reversed":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *WalletService) createNewPromptPayTopup(ctx context.Context, userID string, gross, fee, credit int64) (*entity.TopupResult, error) {
 	sourceID, qrURL, err := s.createPromptPaySource(ctx, gross)
 	if err != nil {
 		return nil, err
@@ -88,18 +294,7 @@ func (s *WalletService) CreatePromptPayTopup(ctx context.Context, in entity.Topu
 		return nil, err
 	}
 
-	var charge struct {
-		ID     string `json:"id"`
-		Paid   bool   `json:"paid"`
-		Status string `json:"status"`
-		Source struct {
-			ScannableCode struct {
-				Image struct {
-					DownloadURI string `json:"download_uri"`
-				} `json:"image"`
-			} `json:"scannable_code"`
-		} `json:"source"`
-	}
+	var charge omiseChargeJSON
 	if err := json.Unmarshal(body, &charge); err != nil {
 		return nil, err
 	}
@@ -117,7 +312,7 @@ func (s *WalletService) CreatePromptPayTopup(ctx context.Context, in entity.Topu
 		return nil, errors.New("cannot get promptpay qr data from source/charge")
 	}
 
-	if err := s.repository.InsertTransaction(charge.ID, userID, gross, fee, credit, "pending", false, false); err != nil {
+	if err := s.repository.InsertTransaction(charge.ID, userID, gross, fee, credit, "pending", false, false, qrURL); err != nil {
 		return nil, err
 	}
 	if err := s.repository.UpdateTransactionStatus(charge.ID, charge.Status, charge.Paid); err != nil {
@@ -131,6 +326,7 @@ func (s *WalletService) CreatePromptPayTopup(ctx context.Context, in entity.Topu
 		PaidAmount:   gross,
 		FeeAmount:    fee,
 		CreditAmount: credit,
+		ExpiresAt:    charge.ExpiresAt,
 	}, nil
 }
 
@@ -193,31 +389,83 @@ func (s *WalletService) getPromptPayQRFromSource(ctx context.Context, sourceID s
 }
 
 // FetchChargeStateFromAPI loads charge paid/status from Omise (GET /charges/:id).
-// Use when webhook requests have no Omise-Signature headers — Omise only sends signatures after you configure a webhook secret in the dashboard; otherwise use this event-verification path per https://docs.omise.co/api-webhooks#protecting-your-endpoints
 func (s *WalletService) FetchChargeStateFromAPI(ctx context.Context, chargeID string) (status string, paid bool, err error) {
+	details, err := s.fetchChargeDetails(ctx, chargeID)
+	if err != nil {
+		return "", false, err
+	}
+	return details.Status, details.Paid, nil
+}
+
+type omiseChargeDetails struct {
+	Status        string
+	Paid          bool
+	Expired       bool
+	ExpiresAt     string
+	DisputeID     string
+	DisputeStatus string
+	QRURL         string
+	SourceID      string
+}
+
+type omiseChargeJSON struct {
+	ID        string `json:"id"`
+	Status    string `json:"status"`
+	Paid      bool   `json:"paid"`
+	Expired   bool   `json:"expired"`
+	ExpiresAt string `json:"expires_at"`
+	Dispute   *struct {
+		ID     string `json:"id"`
+		Status string `json:"status"`
+	} `json:"dispute"`
+	Source struct {
+		ID            string `json:"id"`
+		ScannableCode struct {
+			Image struct {
+				DownloadURI string `json:"download_uri"`
+			} `json:"image"`
+		} `json:"scannable_code"`
+	} `json:"source"`
+}
+
+func omiseChargeDetailsFromJSON(ch omiseChargeJSON) omiseChargeDetails {
+	d := omiseChargeDetails{
+		Status:    strings.TrimSpace(ch.Status),
+		Paid:      ch.Paid,
+		Expired:   ch.Expired,
+		ExpiresAt: strings.TrimSpace(ch.ExpiresAt),
+		QRURL:     strings.TrimSpace(ch.Source.ScannableCode.Image.DownloadURI),
+		SourceID:  strings.TrimSpace(ch.Source.ID),
+	}
+	if ch.Dispute != nil {
+		d.DisputeID = strings.TrimSpace(ch.Dispute.ID)
+		d.DisputeStatus = strings.TrimSpace(ch.Dispute.Status)
+	}
+	return d
+}
+
+func (s *WalletService) fetchChargeDetails(ctx context.Context, chargeID string) (omiseChargeDetails, error) {
+	var empty omiseChargeDetails
 	chargeID = strings.TrimSpace(chargeID)
 	if chargeID == "" {
-		return "", false, errors.New("empty charge id")
+		return empty, errors.New("empty charge id")
 	}
 	if s.omiseSecretKey == "" {
-		return "", false, errors.New("missing omise secret key")
+		return empty, errors.New("missing omise secret key")
 	}
 	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("https://api.omise.co/charges/%s", url.PathEscape(chargeID)), nil)
 	if err != nil {
-		return "", false, err
+		return empty, err
 	}
 	body, err := omisehttp.Do(ctx, s.httpClient, s.omiseSecretKey, req, "omise charge fetch failed")
 	if err != nil {
-		return "", false, err
+		return empty, err
 	}
-	var ch struct {
-		Status string `json:"status"`
-		Paid   bool   `json:"paid"`
-	}
+	var ch omiseChargeJSON
 	if err := json.Unmarshal(body, &ch); err != nil {
-		return "", false, err
+		return empty, err
 	}
-	return strings.TrimSpace(ch.Status), ch.Paid, nil
+	return omiseChargeDetailsFromJSON(ch), nil
 }
 
 func (s *WalletService) ProcessWebhookCharge(chargeID, status string, paid bool) error {
@@ -243,17 +491,17 @@ func (s *WalletService) ProcessWebhookCharge(chargeID, status string, paid bool)
 
 	credit := topup.CreditAmount
 	if credit <= 0 {
-		credit = s.feesCalc.TopupNetCredit(topup.Amount)
+		credit = s.feesCalc(context.Background()).TopupNetCredit(topup.Amount)
 	}
 	return s.repository.AddUserCredit(topup.UserID, credit)
 }
 
-func (s *WalletService) ListCreditActivity(userID string, limit, offset int, filter string) ([]entity.CreditActivityRow, int, error) {
+func (s *WalletService) ListCreditActivity(userID string, limit, offset int, filter, sortKey, sortOrder string) ([]entity.CreditActivityRow, int, error) {
 	total, err := s.repository.CountCreditActivity(userID, filter)
 	if err != nil {
 		return nil, 0, err
 	}
-	rows, err := s.repository.ListCreditActivity(userID, limit, offset, filter)
+	rows, err := s.repository.ListCreditActivity(userID, limit, offset, filter, sortKey, sortOrder)
 	if err != nil {
 		return nil, 0, err
 	}

@@ -14,4 +14,6 @@ type TopupResult struct {
 	PaidAmount   int64
 	FeeAmount    int64
 	CreditAmount int64
+	ExpiresAt    string
+	Resumed      bool
 }
